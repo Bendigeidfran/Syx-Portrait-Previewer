@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Songs of Syx portrait previewer</title>
+	<style>
+		:root {
+			color-scheme: dark;
+			--bg: #16130f;
+			--panel: #241f1a;
+			--ink: #f3ecdf;
+			--muted: #b7ab9a;
+			--line: #3c342c;
+			--accent: #e0b15a;
+			--danger: #e7a394;
+		}
+		* { box-sizing: border-box; }
+		body {
+			margin: 0;
+			background: var(--bg);
+			color: var(--ink);
+			font: 16px/1.45 "Segoe UI", sans-serif;
+		}
+		header, main { max-width: 1080px; margin: 0 auto; padding: 24px 20px; }
+		header { padding-bottom: 0; }
+		h1 { font-size: 1.6rem; font-weight: 650; margin: 0 0 8px; }
+		.lede { margin: 0; max-width: 68ch; color: var(--muted); }
+		main {
+			display: grid;
+			grid-template-columns: minmax(280px, 1fr) auto;
+			gap: 28px;
+			align-items: start;
+		}
+		section { margin: 0 0 22px; }
+		h2 { font-size: 0.95rem; margin: 0 0 8px; letter-spacing: 0.02em; }
+		.hint { color: var(--muted); margin: 0; }
+		.hint + .hint { margin-top: 6px; }
+		.pickers, .knobs, .randoms { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+		.picker { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+		.picker .path { margin: 0; color: var(--muted); font-size: 0.85rem; }
+		.picker code { color: var(--ink); }
+		button, select, input[type="number"] {
+			background: #322b24;
+			color: var(--ink);
+			border: 1px solid var(--line);
+			border-radius: 6px;
+			padding: 6px 10px;
+			font: inherit;
+		}
+		button { cursor: pointer; }
+		button:hover { border-color: var(--accent); }
+		button:disabled { opacity: 0.4; cursor: default; }
+		#sources { list-style: none; margin: 10px 0 0; padding: 0; }
+		#sources li {
+			display: flex;
+			justify-content: space-between;
+			gap: 8px;
+			align-items: center;
+			padding: 6px 0;
+			border-top: 1px solid var(--line);
+		}
+		.row-buttons { display: flex; gap: 4px; flex: none; }
+		.row-buttons button { padding: 2px 8px; }
+		.stage {
+			position: sticky;
+			top: 16px;
+			background: var(--panel);
+			border: 1px solid var(--line);
+			border-radius: 12px;
+			padding: 16px;
+		}
+		canvas {
+			display: block;
+			background: #0c0b09;
+			image-rendering: crisp-edges;
+			image-rendering: pixelated;
+			max-width: min(100%, 70vw);
+			height: auto;
+		}
+		#status, #parts { margin: 10px 0 0; }
+		#parts { color: var(--muted); max-width: 28ch; }
+		label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 0.92rem; }
+		label.check { flex-direction: row; align-items: center; gap: 6px; color: var(--ink); }
+		input[type="range"] { width: 140px; }
+		.randoms label { min-width: 92px; }
+		#warnings {
+			margin: 8px 0 0;
+			padding-left: 18px;
+			color: var(--danger);
+		}
+		#drop.hot { outline: 2px dashed var(--accent); outline-offset: 6px; }
+		.file { display: none; }
+		@media (max-width: 800px) {
+			main { grid-template-columns: 1fr; }
+			.stage { position: static; }
+		}
+	</style>
+</head>
+<body id="drop">
+	<header>
+		<h1>Portrait previewer</h1>
+		<p class="lede">Preview a Songs of Syx race portrait from your own files. Add the game’s <code>sprite/race/face</code> folder first, then a sprite <code>.txt</code>. Add vanilla before a mod: a later file replaces tags in an earlier file of the same name, and a later image replaces an image of the same name. Nothing is uploaded.</p>
+	</header>
+	<main>
+		<div>
+			<section>
+				<h2>Files</h2>
+				<div class="pickers">
+					<div class="picker">
+						<button type="button" id="add-faces">Add face folder</button>
+						<p class="path"><code>assets/sprite/race/face</code></p>
+					</div>
+					<div class="picker">
+						<button type="button" id="add-sprites">Add sprite files</button>
+						<p class="path"><code>assets/init/race/sprite/*.txt</code></p>
+					</div>
+					<div class="picker">
+						<button type="button" id="add-sprite-folder">Add sprite folder</button>
+						<p class="path"><code>assets/init/race/sprite</code></p>
+					</div>
+				</div>
+				<input class="file" id="face-folder" type="file" webkitdirectory accept="image/png">
+				<input class="file" id="sprite-files" type="file" accept=".txt,text/plain" multiple>
+				<input class="file" id="sprite-folder" type="file" webkitdirectory>
+				<ol id="sources"></ol>
+			</section>
+			<section>
+				<h2>Portrait</h2>
+				<div class="knobs">
+					<label>Appearance
+						<select id="appearance"></select>
+					</label>
+					<label>Type
+						<select id="type"></select>
+					</label>
+					<label>Scale <span id="scale-out">4</span>
+						<input id="scale" type="range" min="1" max="8" step="1" value="4">
+					</label>
+				</div>
+			</section>
+			<section>
+				<h2>Subject</h2>
+				<div class="knobs">
+					<label>Seed
+						<input id="seed" type="number" min="0" step="1" value="1">
+					</label>
+					<button type="button" id="roll">Roll</button>
+					<button type="button" id="randomise">Randomise</button>
+					<label>Age
+						<input id="age" type="number" min="0" max="1" step="0.01" value="0.4">
+					</label>
+					<label>Plate
+						<input id="plate" type="number" min="0" max="5" step="1" value="0">
+					</label>
+					<label>Grime
+						<input id="grime" type="number" min="0" max="1" step="0.01" value="0">
+					</label>
+					<label>Injuries
+						<input id="injury" type="number" min="0" max="1" step="0.01" value="0">
+					</label>
+					<label class="check"><input id="dead" type="checkbox">Dead</label>
+					<label class="check"><input id="noble" type="checkbox">Noble</label>
+					<label class="check"><input id="slave" type="checkbox">Slave</label>
+					<label class="check"><input id="parent" type="checkbox">Parent</label>
+					<label class="check"><input id="retired" type="checkbox">Retired</label>
+					<label class="check"><input id="sick" type="checkbox">Sick</label>
+				</div>
+				<p class="hint">Random ints: <span id="ints"></span>. These are the bits the portrait rolls from. The seed is not the game’s own random sequence, so it will not recreate one particular person.</p>
+				<p class="hint">Randomise keeps this race and type and makes a new arrival: new random bits, an age in the first half of the base 100-year life, and the arrival grime roll. A new subject is not dead, noble, a slave, a parent, retired, or sick, and wears no plate. A child is newborn. Race lifespan bonuses are not in the sprite file.</p>
+				<p class="hint">Sick uses one stand-in green. The game tints with the disease colour. Grime and blood appear once the amount reaches 0.25, 0.50, and 0.75. Parent with Slave is a slave parent. A child with Slave is a child slave.</p>
+			</section>
+			<section>
+				<h2>Random values</h2>
+				<div class="randoms" id="randoms"></div>
+			</section>
+			<ul id="warnings" hidden></ul>
+		</div>
+		<div class="stage">
+			<canvas id="portrait" width="160" height="256"></canvas>
+			<p id="status"></p>
+			<p id="parts"></p>
+		</div>
+	</main>
+	<script>
+		const randoms = document.getElementById("randoms");
+		for (let i = 0; i < 8; i++) {
+			const label = document.createElement("label");
+			label.innerHTML = "Random " + i + " <span id=\"random-out-" + i + "\">0</span>";
+			const input = document.createElement("input");
+			input.id = "random-" + i;
+			input.type = "range";
+			input.min = "0";
+			input.max = "255";
+			input.step = "1";
+			input.value = "0";
+			label.appendChild(input);
+			randoms.appendChild(label);
+		}
+	</script>
+	<script src="portrait.js"></script>
+	<script>Portrait.boot();</script>
+</body>
+</html>
