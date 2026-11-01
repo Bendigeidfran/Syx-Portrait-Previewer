@@ -36,10 +36,17 @@
 		h2 { font-size: 0.95rem; margin: 0 0 8px; letter-spacing: 0.02em; }
 		.hint { color: var(--muted); margin: 0; }
 		.hint + .hint { margin-top: 6px; }
-		.pickers, .knobs, .randoms { display: flex; flex-wrap: wrap; gap: 8px 16px; }
-		.picker { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
-		.picker .path { margin: 0; color: var(--muted); font-size: 0.85rem; }
-		.picker code { color: var(--ink); }
+		.knobs, .randoms { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+		.drop-prompt {
+			margin: 0 0 12px;
+			padding: 14px 16px;
+			border: 1px dashed var(--line);
+			border-radius: 8px;
+		}
+		.drop-prompt ol { margin: 0 0 8px; padding-left: 22px; }
+		.drop-prompt code { color: var(--ink); }
+		#drop-notice { margin: 0 0 12px; color: var(--danger); }
+		#vanilla { margin: 0; }
 		button, select, input[type="number"] {
 			background: #322b24;
 			color: var(--ink);
@@ -78,19 +85,25 @@
 			max-width: min(100%, 70vw);
 			height: auto;
 		}
+		#export { margin-top: 12px; }
 		#status, #parts { margin: 10px 0 0; }
 		#parts { color: var(--muted); max-width: 28ch; }
 		label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 0.92rem; }
 		label.check { flex-direction: row; align-items: center; gap: 6px; color: var(--ink); }
 		input[type="range"] { width: 140px; }
 		.randoms label { min-width: 92px; }
+		#pieces { display: flex; flex-direction: column; gap: 6px; }
+		.piece { display: flex; align-items: center; gap: 8px; }
+		.piece .name { flex: 1; min-width: 0; }
+		.piece .count { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+		.piece.hidden { opacity: 0.55; }
+		.piece button { padding: 2px 8px; }
 		#warnings {
 			margin: 8px 0 0;
 			padding-left: 18px;
 			color: var(--danger);
 		}
-		#drop.hot { outline: 2px dashed var(--accent); outline-offset: 6px; }
-		.file { display: none; }
+		#drop.hot { outline: 2px dashed var(--accent); outline-offset: -6px; }
 		@media (max-width: 800px) {
 			main { grid-template-columns: 1fr; }
 			.stage { position: static; }
@@ -100,31 +113,27 @@
 <body id="drop">
 	<header>
 		<h1>Portrait previewer</h1>
-		<p class="lede">Preview a Songs of Syx race portrait from your own files. Add the game’s <code>sprite/race/face</code> folder first, then a sprite <code>.txt</code>. Add vanilla before a mod: a later file replaces tags in an earlier file of the same name, and a later image replaces an image of the same name. Nothing is uploaded.</p>
+		<p class="lede">Preview Songs of Syx race portraits, built the way the game builds them, from your own game and mod files.</p>
 	</header>
 	<main>
 		<div>
 			<section>
 				<h2>Files</h2>
-				<div class="pickers">
-					<div class="picker">
-						<button type="button" id="add-faces">Add face folder</button>
-						<p class="path"><code>assets/sprite/race/face</code></p>
-					</div>
-					<div class="picker">
-						<button type="button" id="add-sprites">Add sprite files</button>
-						<p class="path"><code>assets/init/race/sprite/*.txt</code></p>
-					</div>
-					<div class="picker">
-						<button type="button" id="add-sprite-folder">Add sprite folder</button>
-						<p class="path"><code>assets/init/race/sprite</code></p>
-					</div>
+				<div class="drop-prompt">
+					<ol>
+						<li>Drop the game’s <code>base/data.zip</code> anywhere on this page.</li>
+						<li>Optionally, drop a mod’s main folder, the one holding <code>_Info.txt</code>. Drop one mod at a time.</li>
+					</ol>
+					<p class="hint">Your files stay on this computer. Nothing is uploaded.</p>
 				</div>
-				<p class="hint">Your browser may ask to view the folder. The files stay on this computer.</p>
-				<input class="file" id="face-folder" type="file" webkitdirectory accept="image/png">
-				<input class="file" id="sprite-files" type="file" accept=".txt,text/plain" multiple>
-				<input class="file" id="sprite-folder" type="file" webkitdirectory>
+				<p id="drop-notice" role="status" hidden></p>
+				<h2>Game</h2>
+				<p id="vanilla"></p>
+			</section>
+			<section>
+				<h2>Mods</h2>
 				<ol id="sources"></ol>
+				<p class="hint">Numbered like the launcher’s load order. The lowest number wins when mods supply the same tag or image. Roll and Randomise read mod folders again, so your edits show up.</p>
 			</section>
 			<section>
 				<h2>Portrait</h2>
@@ -139,6 +148,11 @@
 						<input id="scale" type="range" min="1" max="8" step="1" value="4">
 					</label>
 				</div>
+			</section>
+			<section>
+				<h2>Pieces</h2>
+				<div id="pieces"></div>
+				<p class="hint">Steps through the frames this race lists for that piece. Another race or type starts again from the roll. A piece you step stays on that frame when you roll.</p>
 			</section>
 			<section>
 				<h2>Subject</h2>
@@ -179,6 +193,7 @@
 		</div>
 		<div class="stage">
 			<canvas id="portrait" width="160" height="256"></canvas>
+			<button type="button" id="export">Export PNG</button>
 			<p id="status"></p>
 			<p id="parts"></p>
 		</div>

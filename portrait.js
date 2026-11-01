@@ -208,37 +208,60 @@
 		return base;
 	}
 
-	function groupSprites(sources) {
-		const byName = new Map();
-		const order = [];
-		sources.forEach(function (src) {
-			if (!src || src.kind !== "sprites") return;
-			if (src.ignoreVanilla) {
-				const keep = new Set();
-				src.files.forEach(function (file) {
-					const name = spriteKey(file.name);
-					if (name) keep.add(name);
+	// Sources are vanilla plus the mods in launcher order, where the lowest number wins.
+	// Text files stack from vanilla up to mod 0. For an image, the first copy found is used.
+	// _IgnoreVanilla.txt hides vanilla files that no mod supplies. It does not hide other mods.
+	function layerSources(vanilla, mods) {
+		const images = new Map();
+		const vanillaSprites = new Map();
+		if (vanilla) {
+			vanilla.sprites.forEach(function (file) { vanillaSprites.set(spriteKey(file.name), file); });
+			vanilla.images.forEach(function (image, name) { images.set(name, image); });
+		}
+		const names = new Set();
+		let hideVanilla = false;
+		mods.forEach(function (mod) {
+			if (mod.ignoreVanilla) hideVanilla = true;
+			mod.sprites.forEach(function (file) { names.add(spriteKey(file.name)); });
+		});
+		if (!hideVanilla) vanillaSprites.forEach(function (file, name) { names.add(name); });
+		for (let m = mods.length - 1; m >= 0; m--) {
+			mods[m].images.forEach(function (image, name) { images.set(name, image); });
+		}
+		const sprites = Array.from(names).sort().map(function (name) {
+			const files = [];
+			if (vanillaSprites.has(name)) files.push(vanillaSprites.get(name));
+			for (let m = mods.length - 1; m >= 0; m--) {
+				mods[m].sprites.forEach(function (file) {
+					if (spriteKey(file.name) === name) files.push(file);
 				});
-				for (let i = order.length - 1; i >= 0; i--) {
-					if (!keep.has(order[i])) {
-						byName.delete(order[i]);
-						order.splice(i, 1);
-					}
-				}
 			}
-			src.files.forEach(function (file) {
-				const name = spriteKey(file.name);
-				if (!name) return;
-				if (!byName.has(name)) {
-					byName.set(name, []);
-					order.push(name);
-				}
-				byName.get(name).push(file);
-			});
+			return { name: name, files: files };
 		});
-		return order.map(function (name) {
-			return { name: name, files: byName.get(name) };
-		});
+		return { sprites: sprites, images: images };
+	}
+
+	// ModInfo.bestVersion, including its fallback when no folder matches the game.
+	function bestVersion(folderNames, major) {
+		let best = -1;
+		const sorted = folderNames.filter(function (name) { return name.charAt(0) !== "_"; }).sort();
+		for (let i = 0; i < sorted.length; i++) {
+			const name = sorted[i];
+			if (name.length < 2 || name.charAt(0) !== "V" || !/^[+-]?\d+$/.test(name.slice(1))) continue;
+			const version = parseInt(name.slice(1), 10);
+			if (major == null) {
+				if (version > best) best = version;
+				continue;
+			}
+			if (version === major) return version;
+			if (major - version > best) best = version;
+		}
+		return best === -1 ? null : best;
+	}
+
+	function gameVersion(patchnotes) {
+		const match = /^\d{4}-\d{2}-\d{2}\s+(0\.(\d+)\.\d+)/m.exec(patchnotes || "");
+		return match ? { label: match[1], major: parseInt(match[2], 10) } : null;
 	}
 
 	function spriteKey(fileName) {
@@ -252,6 +275,168 @@
 		const base = fileName.split(/[/\\]/).pop();
 		if (!base || !/\.png$/i.test(base)) return null;
 		return base.slice(0, -4);
+	}
+
+	const ZIP_FACE_FOLDER = "data/assets/sprite/race/face/";
+	const ZIP_SPRITE_FOLDER = "data/assets/init/race/sprite/";
+	const ZIP_PATCHNOTES = "base/txt/Patchnotes.txt";
+	const ZIP_EOCD_MAX = 22 + 65535;
+
+	function zipError(message, unsupported) {
+		const err = new Error(message);
+		err.unsupported = !!unsupported;
+		return err;
+	}
+
+	async function viewOf(blob, start, end) {
+		return new DataView(await blob.slice(start, end).arrayBuffer());
+	}
+
+	// Reads the index at the end of the zip. Only the byte ranges asked for are read.
+	async function openZip(blob) {
+		const tailStart = Math.max(0, blob.size - ZIP_EOCD_MAX);
+		const tail = await viewOf(blob, tailStart, blob.size);
+		let eocd = -1;
+		for (let i = tail.byteLength - 22; i >= 0; i--) {
+			if (tail.getUint32(i, true) === 0x06054B50 && i + 22 + tail.getUint16(i + 20, true) <= tail.byteLength) {
+				eocd = i;
+				break;
+			}
+		}
+		if (eocd < 0) throw zipError("This is not a zip file");
+		const count = tail.getUint16(eocd + 10, true);
+		const directorySize = tail.getUint32(eocd + 12, true);
+		const directoryStart = tail.getUint32(eocd + 16, true);
+		const hasLocator = eocd >= 20 && tail.getUint32(eocd - 20, true) === 0x07064B50;
+		if (hasLocator || count === 0xFFFF || directorySize === 0xFFFFFFFF || directoryStart === 0xFFFFFFFF) {
+			throw zipError("This zip uses Zip64, which this page cannot read yet", true);
+		}
+		const directory = await viewOf(blob, directoryStart, directoryStart + directorySize);
+		const bytes = new Uint8Array(directory.buffer, directory.byteOffset, directory.byteLength);
+		const decoder = new TextDecoder("utf-8");
+		const entries = new Map();
+		let at = 0;
+		for (let i = 0; i < count; i++) {
+			if (at + 46 > directory.byteLength || directory.getUint32(at, true) !== 0x02014B50) {
+				throw zipError("This zip's file list is damaged");
+			}
+			const nameLength = directory.getUint16(at + 28, true);
+			const path = decoder.decode(bytes.subarray(at + 46, at + 46 + nameLength));
+			entries.set(path, {
+				path: path,
+				flags: directory.getUint16(at + 8, true),
+				method: directory.getUint16(at + 10, true),
+				compressedSize: directory.getUint32(at + 20, true),
+				localOffset: directory.getUint32(at + 42, true)
+			});
+			at += 46 + nameLength + directory.getUint16(at + 30, true) + directory.getUint16(at + 32, true);
+		}
+		return { blob: blob, entries: entries };
+	}
+
+	async function readZipEntry(blob, entry, type) {
+		if (entry.flags & 1) throw zipError(entry.path + " is encrypted", true);
+		if (entry.compressedSize === 0xFFFFFFFF || entry.localOffset === 0xFFFFFFFF) {
+			throw zipError(entry.path + " uses Zip64, which this page cannot read yet", true);
+		}
+		if (entry.method !== 0 && entry.method !== 8) {
+			throw zipError(entry.path + " uses a compression method this page cannot read", true);
+		}
+		const header = await viewOf(blob, entry.localOffset, entry.localOffset + 30);
+		if (header.byteLength < 30 || header.getUint32(0, true) !== 0x04034B50) throw zipError(entry.path + " is damaged");
+		const start = entry.localOffset + 30 + header.getUint16(26, true) + header.getUint16(28, true);
+		const data = blob.slice(start, start + entry.compressedSize, type || "");
+		if (entry.method === 0) return data;
+		const inflated = data.stream().pipeThrough(new DecompressionStream("deflate-raw"));
+		const out = await new Response(inflated).blob();
+		return out.slice(0, out.size, type || "");
+	}
+
+	function isGameZip(zip) {
+		let faces = false;
+		let sprites = false;
+		zip.entries.forEach(function (entry, path) {
+			if (path.indexOf(ZIP_FACE_FOLDER) === 0) faces = true;
+			if (path.indexOf(ZIP_SPRITE_FOLDER) === 0) sprites = true;
+		});
+		return faces && sprites;
+	}
+
+	function zipFolderEntries(zip, folder) {
+		const found = [];
+		zip.entries.forEach(function (entry, path) {
+			if (path.indexOf(folder) !== 0) return;
+			const name = path.slice(folder.length);
+			if (name && name.indexOf("/") < 0) found.push({ name: name, entry: entry });
+		});
+		return found;
+	}
+
+	// A dropped item. list() and read() go back to the file on disk, so edits are seen
+	// on the next read. Nothing is sent anywhere.
+	function entryNode(entry) {
+		return {
+			name: entry.name,
+			isDirectory: entry.isDirectory,
+			list: async function () {
+				const reader = entry.createReader();
+				const nodes = [];
+				while (true) {
+					const batch = await new Promise(function (resolve, reject) { reader.readEntries(resolve, reject); });
+					if (!batch.length) return nodes;
+					batch.forEach(function (child) { nodes.push(entryNode(child)); });
+				}
+			},
+			read: function () {
+				return new Promise(function (resolve, reject) { entry.file(resolve, reject); });
+			}
+		};
+	}
+
+	function fileNode(file) {
+		return {
+			name: file.name,
+			isDirectory: false,
+			list: function () { return Promise.resolve([]); },
+			read: function () { return Promise.resolve(file); }
+		};
+	}
+
+	// webkitGetAsEntry reads folders under Program Files and AppData, where the game and
+	// its mods live. getAsFileSystemHandle never settles for those folders, so it is not used.
+	// Browsers empty the drop's item list once the event ends, so ask for everything here.
+	function dropNodes(dataTransfer) {
+		const items = dataTransfer.items ? Array.from(dataTransfer.items) : [];
+		const nodes = [];
+		items.forEach(function (item) {
+			if (item.kind !== "file") return;
+			const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
+			const file = !entry && item.getAsFile ? item.getAsFile() : null;
+			if (entry) nodes.push(entryNode(entry));
+			else if (file) nodes.push(fileNode(file));
+		});
+		if (!items.length && dataTransfer.files) {
+			Array.from(dataTransfer.files).forEach(function (file) { nodes.push(fileNode(file)); });
+		}
+		return nodes;
+	}
+
+	function findNode(nodes, name, wantDirectory) {
+		const kind = nodes.filter(function (node) { return node.isDirectory === wantDirectory; });
+		const exact = kind.filter(function (node) { return node.name === name; })[0];
+		if (exact) return exact;
+		const lower = name.toLowerCase();
+		return kind.filter(function (node) { return node.name.toLowerCase() === lower; })[0] || null;
+	}
+
+	async function listFolderAt(root, names) {
+		let nodes = root;
+		for (let i = 0; i < names.length; i++) {
+			const next = findNode(nodes, names[i], true);
+			if (!next) return [];
+			nodes = await next.list();
+		}
+		return nodes;
 	}
 
 	function textOf(node) {
@@ -595,8 +780,8 @@
 		return { name: name, colors: colors, blood: blood, types: types };
 	}
 
-	function appearancesFromSources(sources, warnings) {
-		return groupSprites(sources).map(function (group) {
+	function appearancesFromSources(groups, warnings) {
+		return groups.map(function (group) {
 			const docs = [];
 			group.files.forEach(function (file) {
 				const doc = parseDocument(file.text, warnings, group.name + ".txt");
@@ -723,6 +908,23 @@
 		return true;
 	}
 
+	function frameChoice(part, subject, pick, warnings) {
+		const count = part.frames.length;
+		const ran = count ? (bitGet(subject.ints, part.random * 16, 31) & 255) : 0;
+		const pinned = pick != null && count > 0;
+		let index = 0;
+		if (count) index = pinned ? ((pick % count) + count) % count : ran % count;
+		const allowed = conditionsPass(part.conditions, subject, warnings || []);
+		const occurs = part.occurrence > (ran & 15);
+		return {
+			index: index,
+			count: count,
+			ran: ran,
+			pinned: pinned,
+			shown: count > 0 && (pinned || (allowed && occurs))
+		};
+	}
+
 	function colorAdd(ca, cb) {
 		const ci = 1 / 127;
 		return ca.map(function (channel, index) {
@@ -773,6 +975,90 @@
 
 	function alphaAt(image, x, y) {
 		return image.data[(y * image.width + x) * 4 + 3];
+	}
+
+	function edgePaper(image, sx, sy) {
+		const paper = new Uint8Array(40 * 48);
+		const tone = new Int16Array(40 * 48);
+		const gray = new Uint8Array(40 * 48);
+		for (let y = 0; y < 48; y++) {
+			for (let x = 0; x < 40; x++) {
+				const si = ((sy + y) * image.width + (sx + x)) * 4;
+				const r = image.data[si];
+				const g = image.data[si + 1];
+				const b = image.data[si + 2];
+				const a = image.data[si + 3];
+				const k = y * 40 + x;
+				if (a === 0) {
+					tone[k] = -1;
+					continue;
+				}
+				const hi = r > g ? (r > b ? r : b) : (g > b ? g : b);
+				const lo = r < g ? (r < b ? r : b) : (g < b ? g : b);
+				tone[k] = lo;
+				gray[k] = hi - lo <= 12 ? 1 : 0;
+			}
+		}
+		const stack = [];
+		function flood(x, y) {
+			if (x < 0 || y < 0 || x >= 40 || y >= 48) return;
+			const k = y * 40 + x;
+			if (paper[k] || tone[k] !== 255) return;
+			paper[k] = 1;
+			stack.push(k);
+		}
+		for (let x = 0; x < 40; x++) {
+			flood(x, 0);
+			flood(x, 47);
+		}
+		for (let y = 0; y < 48; y++) {
+			flood(0, y);
+			flood(39, y);
+		}
+		while (stack.length) {
+			const k = stack.pop();
+			const x = k % 40;
+			const y = (k / 40) | 0;
+			flood(x - 1, y);
+			flood(x + 1, y);
+			flood(x, y - 1);
+			flood(x, y + 1);
+		}
+		let changed = true;
+		while (changed) {
+			changed = false;
+			const peel = [];
+			for (let y = 0; y < 48; y++) {
+				for (let x = 0; x < 40; x++) {
+					const k = y * 40 + x;
+					if (paper[k] || tone[k] < 200 || !gray[k]) continue;
+					let inward = 256;
+					let touches = false;
+					const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+					for (let i = 0; i < 4; i++) {
+						const nx = x + dirs[i][0];
+						const ny = y + dirs[i][1];
+						const outside = nx < 0 || ny < 0 || nx >= 40 || ny >= 48;
+						if (!outside && !paper[ny * 40 + nx]) continue;
+						touches = true;
+						const ix = x - dirs[i][0];
+						const iy = y - dirs[i][1];
+						if (ix < 0 || iy < 0 || ix >= 40 || iy >= 48) continue;
+						const ik = iy * 40 + ix;
+						if (paper[ik] || tone[ik] < 0) continue;
+						if (tone[ik] < inward) inward = tone[ik];
+					}
+					if (touches && inward < 256 && tone[k] >= inward + 40) peel.push(k);
+				}
+			}
+			for (let i = 0; i < peel.length; i++) {
+				if (!paper[peel[i]]) {
+					paper[peel[i]] = 1;
+					changed = true;
+				}
+			}
+		}
+		return paper;
 	}
 
 	function trimFrame(image, frameIndex) {
@@ -826,6 +1112,7 @@
 		}
 		const height = rows * 8;
 		const pixels = new Uint8ClampedArray(40 * height * 4);
+		const paper = edgePaper(image, sx, sy);
 		for (let y = 0; y < height; y++) {
 			for (let x = 0; x < 40; x++) {
 				const si = ((y1 + y) * image.width + (sx + x)) * 4;
@@ -833,7 +1120,8 @@
 				pixels[di] = image.data[si];
 				pixels[di + 1] = image.data[si + 1];
 				pixels[di + 2] = image.data[si + 2];
-				pixels[di + 3] = image.data[si + 3];
+				const localY = y1 - sy + y;
+				pixels[di + 3] = paper[localY * 40 + x] ? 0 : image.data[si + 3];
 			}
 		}
 		const frame = { offY: offY, rows: rows, pixels: pixels };
@@ -901,10 +1189,17 @@
 		if (images.has(file)) return images.get(file);
 		const lower = file.toLowerCase();
 		let found = null;
+		let foundName = "";
 		images.forEach(function (image, name) {
-			if (!found && name.toLowerCase() === lower) found = image;
+			if (!found && name.toLowerCase() === lower) {
+				found = image;
+				foundName = name;
+			}
 		});
-		if (found) return found;
+		if (found) {
+			warnings.push(file + " only matches the image " + foundName + " with different capitalisation. The game may not find it.");
+			return found;
+		}
 		if (!missing.has(file)) {
 			missing.add(file);
 			warnings.push("No face image named " + file);
@@ -912,7 +1207,7 @@
 		return null;
 	}
 
-	function renderPortrait(appearance, type, subject, images, scale, warnings) {
+	function renderPortrait(appearance, type, subject, images, scale, warnings, picks) {
 		const width = P_WIDTH * scale;
 		const height = P_HEIGHT * scale;
 		const buf = new Uint8ClampedArray(width * height * 4);
@@ -921,12 +1216,13 @@
 		const badSheets = new Set();
 		let drawn = 0;
 		const names = [];
+		const listed = [];
 		face.forEach(function (part, partIndex) {
-			if (!part.frames.length) return;
-			if (!conditionsPass(part.conditions, subject, warnings)) return;
-			const ran = bitGet(subject.ints, (part.random * 16), 31) & 255;
-			if (part.occurrence <= (ran & 15)) return;
-			const chosen = part.frames[ran % part.frames.length];
+			const choice = frameChoice(part, subject, picks ? picks[partIndex] : null, warnings);
+			listed.push(choice);
+			if (!choice.shown) return;
+			const ran = choice.ran;
+			const chosen = part.frames[choice.index];
 			const image = lookupImage(images, chosen.file, warnings, missing);
 			if (!image) return;
 			if (image.width !== 416 || image.height < 60) {
@@ -971,11 +1267,13 @@
 			drawn++;
 			names.push(part.color || ("part " + (partIndex + 1)));
 		});
-		return { pixels: buf, width: width, height: height, drawn: drawn, total: face.length, names: names };
+		return { pixels: buf, width: width, height: height, drawn: drawn, total: face.length, names: names, choices: listed };
 	}
 
 	function boot() {
 		const sourcesEl = document.getElementById("sources");
+		const vanillaEl = document.getElementById("vanilla");
+		const noticeEl = document.getElementById("drop-notice");
 		const appearanceEl = document.getElementById("appearance");
 		const typeEl = document.getElementById("type");
 		const canvas = document.getElementById("portrait");
@@ -983,12 +1281,14 @@
 		const warningsEl = document.getElementById("warnings");
 		const statusEl = document.getElementById("status");
 		const partsEl = document.getElementById("parts");
+		const piecesEl = document.getElementById("pieces");
 		const seedEl = document.getElementById("seed");
 		const intsEl = document.getElementById("ints");
 		const dropEl = document.getElementById("drop");
 		let nextId = 1;
 		const state = {
-			sources: [],
+			vanilla: null,
+			mods: [],
 			images: new Map(),
 			appearances: [],
 			appearance: 0,
@@ -1006,7 +1306,8 @@
 			grime: 0,
 			injury: 0,
 			scale: 4,
-			loadWarnings: []
+			loadWarnings: [],
+			picks: []
 		};
 
 		function subject() {
@@ -1033,19 +1334,36 @@
 			};
 		}
 
+		function modSummary(mod) {
+			const major = state.vanilla ? state.vanilla.major : null;
+			const parts = [mod.label];
+			if (mod.error) parts.push(mod.error);
+			else if (mod.version != null) {
+				parts.push("V" + mod.version + (major != null && mod.version !== major ? ", game is V" + major : ""));
+				if (!mod.sprites.length && !mod.images.size) parts.push("no portrait files");
+			}
+			return parts.join(" · ");
+		}
+
 		function renderSources() {
+			if (state.vanilla) {
+				const version = state.vanilla.version ? "game " + state.vanilla.version.label : "game version unknown";
+				vanillaEl.textContent = state.vanilla.name + " · " + version + " · " + state.vanilla.sprites.length + " sprite files, " + state.vanilla.images.size + " images";
+			} else {
+				vanillaEl.textContent = "Not added yet.";
+			}
 			sourcesEl.innerHTML = "";
-			if (!state.sources.length) {
-				const empty = document.createElement("p");
+			if (!state.mods.length) {
+				const empty = document.createElement("li");
 				empty.className = "hint";
-				empty.textContent = "Nothing added yet.";
+				empty.textContent = "No mods added. Mods are optional.";
 				sourcesEl.appendChild(empty);
 				return;
 			}
-			state.sources.forEach(function (src, index) {
+			state.mods.forEach(function (mod, index) {
 				const row = document.createElement("li");
 				const label = document.createElement("span");
-				label.textContent = (index + 1) + ". " + (src.kind === "faces" ? "Faces" : "Sprites") + " · " + src.label;
+				label.textContent = index + ". " + modSummary(mod);
 				row.appendChild(label);
 				const controls = document.createElement("span");
 				controls.className = "row-buttons";
@@ -1053,12 +1371,12 @@
 					const button = document.createElement("button");
 					button.type = "button";
 					button.textContent = pair[0];
-					button.disabled = index + pair[1] < 0 || index + pair[1] >= state.sources.length;
+					button.disabled = index + pair[1] < 0 || index + pair[1] >= state.mods.length;
 					button.addEventListener("click", function () {
 						const next = index + pair[1];
-						const item = state.sources.splice(index, 1)[0];
-						state.sources.splice(next, 0, item);
-						rebuild();
+						const item = state.mods.splice(index, 1)[0];
+						state.mods.splice(next, 0, item);
+						rebuild(false);
 					});
 					controls.appendChild(button);
 				});
@@ -1066,8 +1384,8 @@
 				remove.type = "button";
 				remove.textContent = "Remove";
 				remove.addEventListener("click", function () {
-					state.sources.splice(index, 1);
-					rebuild();
+					state.mods.splice(index, 1);
+					rebuild(false);
 				});
 				controls.appendChild(remove);
 				row.appendChild(controls);
@@ -1096,19 +1414,98 @@
 				canvas.height = P_HEIGHT * state.scale;
 				ctx.imageSmoothingEnabled = false;
 				ctx.clearRect(0, 0, canvas.width, canvas.height);
-				statusEl.textContent = state.sources.length ? "No sprite file in the list." : "Add the face folder, then a sprite file.";
+				statusEl.textContent = state.vanilla ? "No sprite files found." : "Drop the game's data.zip onto this page.";
 				partsEl.textContent = "";
+				renderPieces([], subject(), []);
 				showWarnings(warnings);
 				return;
 			}
-			const result = renderPortrait(appearance, type, subject(), state.images, state.scale, warnings);
+			const result = renderPortrait(appearance, type, subject(), state.images, state.scale, warnings, state.picks);
 			canvas.width = result.width;
 			canvas.height = result.height;
 			ctx.imageSmoothingEnabled = false;
 			ctx.putImageData(new ImageData(result.pixels, result.width, result.height), 0, 0);
 			statusEl.textContent = appearance.name + " · " + type.label + " · " + result.drawn + " of " + result.total + " parts";
 			partsEl.textContent = result.names.length ? result.names.join(", ") : "Nothing drawn.";
+			renderPieces(type.face, subject(), result.choices);
 			showWarnings(warnings);
+		}
+
+		function pieceLabel(part) {
+			const files = [];
+			part.frames.forEach(function (frame) {
+				if (files.indexOf(frame.file) < 0) files.push(frame.file);
+			});
+			return files.join(", ") || ("Part " + (part.index + 1));
+		}
+
+		function pieceLabels(face) {
+			const totals = {};
+			const raw = face.map(pieceLabel);
+			raw.forEach(function (label) { totals[label] = (totals[label] || 0) + 1; });
+			const seen = {};
+			return raw.map(function (label) {
+				if (totals[label] === 1) return label;
+				seen[label] = (seen[label] || 0) + 1;
+				return label + " " + seen[label];
+			});
+		}
+
+		function renderPieces(face, subj, choices) {
+			piecesEl.innerHTML = "";
+			const listed = [];
+			for (let i = 0; i < face.length; i++) {
+				if (face[i].frames.length) listed.push(i);
+			}
+			if (!listed.length) {
+				const empty = document.createElement("p");
+				empty.className = "hint";
+				empty.textContent = "Drop data.zip to step through a race's pieces.";
+				piecesEl.appendChild(empty);
+				return;
+			}
+			const labels = pieceLabels(face);
+			listed.forEach(function (partIndex) {
+				const part = face[partIndex];
+				const choice = choices[partIndex] || frameChoice(part, subj, state.picks[partIndex], []);
+				const row = document.createElement("div");
+				row.className = "piece" + (choice.shown ? "" : " hidden");
+				const name = document.createElement("span");
+				name.className = "name";
+				name.textContent = labels[partIndex];
+				const previous = document.createElement("button");
+				previous.type = "button";
+				previous.textContent = "‹";
+				previous.setAttribute("aria-label", "Previous " + labels[partIndex]);
+				previous.disabled = part.frames.length < 2;
+				previous.addEventListener("click", function () { stepPiece(partIndex, -1); });
+				const next = document.createElement("button");
+				next.type = "button";
+				next.textContent = "›";
+				next.setAttribute("aria-label", "Next " + labels[partIndex]);
+				next.disabled = part.frames.length < 2;
+				next.addEventListener("click", function () { stepPiece(partIndex, 1); });
+				const count = document.createElement("span");
+				count.className = "count";
+				count.textContent = (choice.index + 1) + " / " + choice.count + (choice.shown ? "" : " hidden");
+				row.appendChild(name);
+				row.appendChild(previous);
+				row.appendChild(next);
+				row.appendChild(count);
+				piecesEl.appendChild(row);
+			});
+		}
+
+		function stepPiece(partIndex, delta) {
+			const appearance = state.appearances[state.appearance];
+			const type = appearance && appearance.types[state.type];
+			const part = type && type.face[partIndex];
+			if (!part || part.frames.length < 2) return;
+			const count = part.frames.length;
+			let current = state.picks[partIndex];
+			if (current == null) current = frameChoice(part, subject(), null, []).index;
+			state.picks[partIndex] = (current + delta + count) % count;
+			draw();
 		}
 
 		function showWarnings(warnings) {
@@ -1148,40 +1545,54 @@
 			else select.value = options.length ? "0" : "";
 		}
 
-		async function rebuild() {
+		// A rebuild asked for during another one waits, then one more pass applies the
+		// latest state. Passes never overlap, so an old read can't replace a newer one.
+		let building = null;
+		let buildAgain = false;
+		let buildAgainReread = false;
+		function rebuild(reread) {
+			if (building) {
+				buildAgain = true;
+				if (reread) buildAgainReread = true;
+				return building;
+			}
+			building = (async function () {
+				try {
+					let pass = reread;
+					while (true) {
+						await rebuildOnce(pass);
+						if (!buildAgain) break;
+						pass = buildAgainReread;
+						buildAgain = false;
+						buildAgainReread = false;
+					}
+				} finally {
+					building = null;
+				}
+			})();
+			return building;
+		}
+
+		async function rebuildOnce(reread) {
 			warnedStats.clear();
 			renderSources();
 			statusEl.textContent = "Reading files…";
-			const warnings = [];
-			const images = new Map();
-			const spriteSources = [];
-			for (let s = 0; s < state.sources.length; s++) {
-				const src = state.sources[s];
-				if (src.kind === "faces") {
-					for (let f = 0; f < src.files.length; f++) {
-						const file = src.files[f];
-						const key = faceKey(file.name);
-						if (!key) continue;
-						try {
-							images.set(key, await decodeFile(file.file));
-						} catch (err) {
-							warnings.push("Could not read " + file.name);
-						}
-					}
-				} else {
-					const files = [];
-					for (let f = 0; f < src.files.length; f++) {
-						const file = src.files[f];
-						if (!spriteKey(file.name)) continue;
-						files.push({ name: file.name, text: await file.file.text() });
-					}
-					spriteSources.push({ kind: "sprites", ignoreVanilla: src.ignoreVanilla, files: files });
-				}
+			if (reread) {
+				for (let m = 0; m < state.mods.length; m++) await refreshMod(state.mods[m]);
 			}
-			state.images = images;
+			const raceBefore = state.appearances[state.appearance] && state.appearances[state.appearance].name;
+			const typeBefore = state.type;
+			const warnings = [];
+			if (state.vanilla) state.vanilla.warnings.forEach(function (warning) { warnings.push(warning); });
+			state.mods.forEach(function (mod) {
+				mod.warnings.forEach(function (warning) { warnings.push(warning); });
+			});
+			const layers = layerSources(state.vanilla, state.mods);
+			state.images = layers.images;
 			state.loadWarnings = warnings;
-			state.appearances = appearancesFromSources(spriteSources, warnings);
-			if (state.appearance >= state.appearances.length) state.appearance = 0;
+			state.appearances = state.vanilla ? appearancesFromSources(layers.sprites, warnings) : [];
+			const kept = state.appearances.findIndex(function (item) { return item.name === raceBefore; });
+			state.appearance = kept >= 0 ? kept : 0;
 			fillSelect(appearanceEl, state.appearances.map(function (item) { return item.name; }), state.appearance);
 			state.appearance = appearanceEl.value ? Number(appearanceEl.value) : 0;
 			const appearance = state.appearances[state.appearance];
@@ -1189,6 +1600,9 @@
 			if (state.type >= types.length) state.type = 0;
 			fillSelect(typeEl, types.map(function (item) { return item.label; }), state.type);
 			state.type = typeEl.value ? Number(typeEl.value) : 0;
+			const raceAfter = appearance && appearance.name;
+			if (raceBefore !== raceAfter || typeBefore !== state.type) state.picks = [];
+			renderSources();
 			draw();
 		}
 
@@ -1205,141 +1619,206 @@
 			});
 		}
 
-		function addSource(kind, files, label, ignoreVanilla) {
-			const kept = [];
-			for (let i = 0; i < files.length; i++) {
-				const file = files[i];
-				const name = file.name;
-				if (kind === "faces" && faceKey(name)) kept.push({ name: name, file: file });
-				if (kind === "sprites" && spriteKey(name)) kept.push({ name: name, file: file });
+		async function loadZip(node, notices) {
+			const file = await node.read();
+			let zip;
+			try {
+				zip = await openZip(file);
+			} catch (err) {
+				notices.push(err.unsupported ? node.name + ": " + err.message + "." : node.name + " doesn't look like the game's data.zip.");
+				return false;
 			}
-			if (!kept.length) return;
-			state.sources.push({
+			if (!isGameZip(zip)) {
+				notices.push(node.name + " doesn't look like the game's data.zip.");
+				return false;
+			}
+			const warnings = [];
+			const sprites = [];
+			const images = new Map();
+			const spriteEntries = zipFolderEntries(zip, ZIP_SPRITE_FOLDER);
+			for (let i = 0; i < spriteEntries.length; i++) {
+				if (!spriteKey(spriteEntries[i].name)) continue;
+				try {
+					const data = await readZipEntry(file, spriteEntries[i].entry, "text/plain");
+					sprites.push({ name: spriteEntries[i].name, text: await data.text() });
+				} catch (err) {
+					warnings.push("Could not read " + spriteEntries[i].name + " from " + node.name);
+				}
+			}
+			const faceEntries = zipFolderEntries(zip, ZIP_FACE_FOLDER);
+			for (let i = 0; i < faceEntries.length; i++) {
+				const key = faceKey(faceEntries[i].name);
+				if (!key) continue;
+				try {
+					images.set(key, await decodeFile(await readZipEntry(file, faceEntries[i].entry, "image/png")));
+				} catch (err) {
+					warnings.push("Could not read " + faceEntries[i].name + " from " + node.name);
+				}
+			}
+			let version = null;
+			if (zip.entries.has(ZIP_PATCHNOTES)) {
+				try {
+					version = gameVersion(await (await readZipEntry(file, zip.entries.get(ZIP_PATCHNOTES), "text/plain")).text());
+				} catch (err) {}
+			}
+			if (!version) warnings.push("Could not read the game version from " + node.name + ", so each mod uses its highest version folder.");
+			state.vanilla = {
+				name: node.name,
+				version: version,
+				major: version ? version.major : null,
+				sprites: sprites,
+				images: images,
+				warnings: warnings
+			};
+			return true;
+		}
+
+		async function addMod(node, notices) {
+			const root = await node.list();
+			if (!findNode(root, "_Info.txt", false)) {
+				if (/^V\d+$/.test(node.name)) {
+					notices.push(node.name + " is a version folder. Drop the mod's main folder.");
+					return false;
+				}
+				const folders = root.filter(function (child) { return child.isDirectory; });
+				for (let i = 0; i < folders.length; i++) {
+					if (findNode(await folders[i].list(), "_Info.txt", false)) {
+						notices.push(node.name + " holds several mods. Drop one mod at a time.");
+						return false;
+					}
+				}
+				notices.push(node.name + " has no _Info.txt, so it isn't a mod folder.");
+				return false;
+			}
+			const mod = {
 				id: nextId++,
-				kind: kind,
-				label: label || (kept.length === 1 ? kept[0].name : kept.length + " files"),
-				ignoreVanilla: !!ignoreVanilla,
-				files: kept
-			});
+				node: node,
+				folderName: node.name,
+				label: node.name,
+				version: null,
+				error: "",
+				sprites: [],
+				ignoreVanilla: false,
+				images: new Map(),
+				cache: new Map(),
+				warnings: []
+			};
+			const existing = state.mods.findIndex(function (item) { return item.folderName === node.name; });
+			if (existing >= 0) state.mods[existing] = mod;
+			else state.mods.push(mod);
+			return true;
 		}
 
-		function folderLabel(files) {
-			const rel = files[0] && files[0].webkitRelativePath;
-			if (rel) return rel.split(/[/\\]/)[0];
-			return files.length === 1 ? files[0].name : files.length + " files";
-		}
-
-		function takeFiles(fileList) {
-			const files = Array.from(fileList);
-			const pngs = files.filter(function (file) { return faceKey(file.name); });
-			const txts = files.filter(function (file) { return spriteKey(file.name); });
-			const ignore = files.some(function (file) { return file.name === "_IgnoreVanilla.txt"; });
-			if (pngs.length) addSource("faces", pngs, folderLabel(pngs), false);
-			if (txts.length) addSource("sprites", txts, folderLabel(txts), ignore);
-			return pngs.length + txts.length;
-		}
-
-		function bindFile(id, kind) {
-			const input = document.getElementById(id);
-			input.addEventListener("change", function () {
-				if (kind) {
-					const files = Array.from(input.files);
-					const ignore = files.some(function (file) { return file.name === "_IgnoreVanilla.txt"; });
-					addSource(kind, files, folderLabel(files), kind === "sprites" && ignore);
-					if (files.length) rebuild();
-				} else if (takeFiles(input.files)) {
-					rebuild();
-				}
-				input.value = "";
-			});
-		}
-
-		bindFile("face-folder", "faces");
-		bindFile("sprite-files", "sprites");
-		bindFile("sprite-folder", "sprites");
-
-		async function filesInDirectory(handle) {
-			const files = [];
-			const pending = [handle];
-			while (pending.length) {
-				const dir = pending.pop();
-				for await (const entry of dir.values()) {
-					if (entry.kind === "file") files.push(await entry.getFile());
-					else if (entry.kind === "directory") pending.push(entry);
-				}
-			}
-			return files;
-		}
-
-		function cancelled(err) {
-			return err && (err.name === "AbortError" || err.name === "NotAllowedError");
-		}
-
-		// A file input makes Chrome say the files are being uploaded. The read-only
-		// picker asks to view them instead, and the page still only reads them locally.
-		async function pickDirectory(kind, fallbackId) {
-			if (!window.showDirectoryPicker) {
-				document.getElementById(fallbackId).click();
-				return;
-			}
-			let handle;
+		// Goes back to the folder on disk. Unchanged images are not decoded again.
+		// If the folder can't be read, the last good copy stays in use.
+		async function refreshMod(mod) {
+			const major = state.vanilla ? state.vanilla.major : null;
+			const warnings = [];
 			try {
-				handle = await window.showDirectoryPicker({ mode: "read" });
+				const root = await mod.node.list();
+				const info = findNode(root, "_Info.txt", false);
+				let label = mod.folderName;
+				if (info) {
+					const doc = parseDocument(await (await info.read()).text(), warnings, mod.folderName + "/_Info.txt");
+					if (doc && textOf(doc.map.get("NAME"))) label = textOf(doc.map.get("NAME"));
+				}
+				const version = bestVersion(root.filter(function (child) { return child.isDirectory; }).map(function (child) { return child.name; }), major);
+				if (version == null) {
+					mod.label = label;
+					mod.version = null;
+					mod.error = "no version folders";
+					mod.sprites = [];
+					mod.ignoreVanilla = false;
+					mod.images = new Map();
+					mod.cache = new Map();
+					mod.warnings = warnings;
+					return;
+				}
+				const folder = "V" + version;
+				const spriteNodes = await listFolderAt(root, [folder, "assets", "init", "race", "sprite"]);
+				const faceNodes = await listFolderAt(root, [folder, "assets", "sprite", "race", "face"]);
+				const sprites = [];
+				let ignoreVanilla = false;
+				for (let i = 0; i < spriteNodes.length; i++) {
+					const node = spriteNodes[i];
+					if (node.isDirectory) continue;
+					if (node.name === "_IgnoreVanilla.txt") ignoreVanilla = true;
+					if (!spriteKey(node.name)) continue;
+					try {
+						sprites.push({ name: node.name, text: await (await node.read()).text() });
+					} catch (err) {
+						warnings.push("Could not read " + node.name + " from " + label);
+						const last = mod.sprites.filter(function (file) { return file.name === node.name; })[0];
+						if (last) sprites.push(last);
+					}
+				}
+				const images = new Map();
+				const cache = new Map();
+				for (let i = 0; i < faceNodes.length; i++) {
+					const node = faceNodes[i];
+					const key = node.isDirectory ? null : faceKey(node.name);
+					if (!key) continue;
+					const before = mod.cache.get(key);
+					try {
+						const file = await node.read();
+						let stored = before;
+						if (!before || before.size !== file.size || before.lastModified !== file.lastModified) {
+							stored = { size: file.size, lastModified: file.lastModified, image: await decodeFile(file) };
+						}
+						cache.set(key, stored);
+						images.set(key, stored.image);
+					} catch (err) {
+						warnings.push("Could not read " + node.name + " from " + label);
+						if (before) {
+							cache.set(key, before);
+							images.set(key, before.image);
+						}
+					}
+				}
+				mod.label = label;
+				mod.version = version;
+				mod.error = "";
+				mod.sprites = sprites;
+				mod.ignoreVanilla = ignoreVanilla;
+				mod.images = images;
+				mod.cache = cache;
+				mod.warnings = warnings;
 			} catch (err) {
-				if (!cancelled(err)) document.getElementById(fallbackId).click();
-				return;
+				mod.warnings = ["Could not read " + mod.label + " again, so its last copy is in use."];
 			}
+		}
+
+		async function acceptDrop(nodes) {
+			if (!nodes.length) return;
 			statusEl.textContent = "Reading files…";
-			const files = await filesInDirectory(handle);
-			const ignore = files.some(function (file) { return file.name === "_IgnoreVanilla.txt"; });
-			addSource(kind, files, handle.name, kind === "sprites" && ignore);
-			if (files.length) rebuild();
+			const notices = [];
+			let changed = false;
+			for (let i = 0; i < nodes.length; i++) {
+				const node = nodes[i];
+				try {
+					const added = node.isDirectory ? await addMod(node, notices) : await loadZip(node, notices);
+					if (added) changed = true;
+				} catch (err) {
+					notices.push("Could not read " + node.name + ".");
+				}
+			}
+			noticeEl.textContent = notices.join(" ");
+			noticeEl.hidden = !notices.length;
+			if (changed) await rebuild(true);
 			else draw();
 		}
-
-		async function pickSpriteFiles() {
-			if (!window.showOpenFilePicker) {
-				document.getElementById("sprite-files").click();
-				return;
-			}
-			let handles;
-			try {
-				handles = await window.showOpenFilePicker({
-					multiple: true,
-					types: [{ description: "Sprite text", accept: { "text/plain": [".txt"] } }]
-				});
-			} catch (err) {
-				if (!cancelled(err)) document.getElementById("sprite-files").click();
-				return;
-			}
-			statusEl.textContent = "Reading files…";
-			const files = [];
-			for (let i = 0; i < handles.length; i++) files.push(await handles[i].getFile());
-			const ignore = files.some(function (file) { return file.name === "_IgnoreVanilla.txt"; });
-			addSource("sprites", files, folderLabel(files), ignore);
-			if (files.length) rebuild();
-			else draw();
-		}
-
-		document.getElementById("add-faces").addEventListener("click", function () {
-			pickDirectory("faces", "face-folder");
-		});
-		document.getElementById("add-sprites").addEventListener("click", function () {
-			pickSpriteFiles();
-		});
-		document.getElementById("add-sprite-folder").addEventListener("click", function () {
-			pickDirectory("sprites", "sprite-folder");
-		});
 
 		appearanceEl.addEventListener("change", function () {
 			state.appearance = Number(appearanceEl.value) || 0;
 			state.type = 0;
+			state.picks = [];
 			const appearance = state.appearances[state.appearance];
 			fillSelect(typeEl, appearance ? appearance.types.map(function (item) { return item.label; }) : [], 0);
 			draw();
 		});
 		typeEl.addEventListener("change", function () {
 			state.type = Number(typeEl.value) || 0;
+			state.picks = [];
 			draw();
 		});
 
@@ -1404,34 +1883,61 @@
 			state.ints = intsFromSeed(state.seed);
 		}
 
-		document.getElementById("roll").addEventListener("click", function () {
-			rollSeed(rng());
-			draw();
-		});
-		document.getElementById("randomise").addEventListener("click", function () {
+		let reading = false;
+		function reroll(randomise) {
+			if (reading) return;
+			reading = true;
 			const random = rng();
 			rollSeed(random);
+			if (randomise) {
+				const appearance = state.appearances[state.appearance];
+				const type = appearance && appearance.types[state.type];
+				const arrival = randomArrival(type && type.kind === "child" ? "child" : "adult", random);
+				state.age = arrival.age;
+				state.grime = arrival.grime;
+				state.injury = arrival.injury;
+				state.plate = arrival.plate;
+				state.dead = arrival.dead;
+				state.noble = arrival.noble;
+				state.slave = arrival.slave;
+				state.parent = arrival.parent;
+				state.retired = arrival.retired;
+				state.sick = arrival.sick;
+				document.getElementById("age").value = String(arrival.age);
+				document.getElementById("grime").value = String(arrival.grime);
+				document.getElementById("injury").value = String(arrival.injury);
+				document.getElementById("plate").value = String(arrival.plate);
+				["dead", "noble", "slave", "parent", "retired", "sick"].forEach(function (key) {
+					document.getElementById(key).checked = arrival[key];
+				});
+			}
+			rebuild(true).then(function () { reading = false; }, function () { reading = false; });
+		}
+
+		document.getElementById("roll").addEventListener("click", function () { reroll(false); });
+		document.getElementById("randomise").addEventListener("click", function () { reroll(true); });
+		document.getElementById("export").addEventListener("click", function () {
 			const appearance = state.appearances[state.appearance];
 			const type = appearance && appearance.types[state.type];
-			const arrival = randomArrival(type && type.kind === "child" ? "child" : "adult", random);
-			state.age = arrival.age;
-			state.grime = arrival.grime;
-			state.injury = arrival.injury;
-			state.plate = arrival.plate;
-			state.dead = arrival.dead;
-			state.noble = arrival.noble;
-			state.slave = arrival.slave;
-			state.parent = arrival.parent;
-			state.retired = arrival.retired;
-			state.sick = arrival.sick;
-			document.getElementById("age").value = String(arrival.age);
-			document.getElementById("grime").value = String(arrival.grime);
-			document.getElementById("injury").value = String(arrival.injury);
-			document.getElementById("plate").value = String(arrival.plate);
-			["dead", "noble", "slave", "parent", "retired", "sick"].forEach(function (key) {
-				document.getElementById(key).checked = arrival[key];
-			});
-			draw();
+			if (!appearance || !type) {
+				statusEl.textContent = "Nothing to export yet.";
+				return;
+			}
+			const name = [appearance.name, type.label, String(state.seed)].map(function (part) {
+				return String(part).replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "");
+			}).filter(Boolean).join("-") + ".png";
+			canvas.toBlob(function (blob) {
+				if (!blob) {
+					statusEl.textContent = "Could not export the portrait.";
+					return;
+				}
+				const url = URL.createObjectURL(blob);
+				const link = document.createElement("a");
+				link.href = url;
+				link.download = name;
+				link.click();
+				setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+			}, "image/png");
 		});
 		document.getElementById("scale").addEventListener("input", function (event) {
 			state.scale = parseInt(event.target.value, 10) || 4;
@@ -1446,27 +1952,9 @@
 			});
 		}
 
-		async function entriesOf(entry) {
-			if (entry.isFile) {
-				const file = await new Promise(function (resolve, reject) { entry.file(resolve, reject); });
-				return [file];
-			}
-			if (!entry.isDirectory) return [];
-			const reader = entry.createReader();
-			const nested = [];
-			while (true) {
-				const batch = await new Promise(function (resolve, reject) { reader.readEntries(resolve, reject); });
-				if (!batch.length) break;
-				for (let i = 0; i < batch.length; i++) {
-					const found = await entriesOf(batch[i]);
-					found.forEach(function (file) { nested.push(file); });
-				}
-			}
-			return nested;
-		}
-
 		window.addEventListener("dragover", function (event) {
 			event.preventDefault();
+			if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
 			dropEl.classList.add("hot");
 		});
 		window.addEventListener("dragleave", function () {
@@ -1475,25 +1963,7 @@
 		window.addEventListener("drop", function (event) {
 			event.preventDefault();
 			dropEl.classList.remove("hot");
-			const items = event.dataTransfer.items;
-			if (!items || !items.length) {
-				if (takeFiles(event.dataTransfer.files)) rebuild();
-				return;
-			}
-			const jobs = [];
-			for (let i = 0; i < items.length; i++) {
-				const entry = items[i].webkitGetAsEntry && items[i].webkitGetAsEntry();
-				if (entry) jobs.push(entriesOf(entry));
-			}
-			if (!jobs.length) {
-				if (takeFiles(event.dataTransfer.files)) rebuild();
-				return;
-			}
-			Promise.all(jobs).then(function (groups) {
-				let added = 0;
-				groups.forEach(function (files) { added += takeFiles(files); });
-				if (added) rebuild();
-			});
+			acceptDrop(dropNodes(event.dataTransfer));
 		});
 
 		seedEl.value = "1";
@@ -1504,7 +1974,16 @@
 	return {
 		parseDocument: parseDocument,
 		mergeDocuments: mergeDocuments,
-		groupSprites: groupSprites,
+		layerSources: layerSources,
+		bestVersion: bestVersion,
+		gameVersion: gameVersion,
+		openZip: openZip,
+		readZipEntry: readZipEntry,
+		isGameZip: isGameZip,
+		zipFolderEntries: zipFolderEntries,
+		entryNode: entryNode,
+		findNode: findNode,
+		listFolderAt: listFolderAt,
 		appearancesFromSources: appearancesFromSources,
 		buildAppearance: buildAppearance,
 		intsFromSeed: intsFromSeed,
@@ -1518,6 +1997,7 @@
 		renderPortrait: renderPortrait,
 		readStat: readStat,
 		conditionsPass: conditionsPass,
+		frameChoice: frameChoice,
 		stainIndex: stainIndex,
 		toSigned: toSigned,
 		boot: boot,
