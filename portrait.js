@@ -1258,14 +1258,77 @@
 		bindFile("sprite-files", "sprites");
 		bindFile("sprite-folder", "sprites");
 
+		async function filesInDirectory(handle) {
+			const files = [];
+			const pending = [handle];
+			while (pending.length) {
+				const dir = pending.pop();
+				for await (const entry of dir.values()) {
+					if (entry.kind === "file") files.push(await entry.getFile());
+					else if (entry.kind === "directory") pending.push(entry);
+				}
+			}
+			return files;
+		}
+
+		function cancelled(err) {
+			return err && (err.name === "AbortError" || err.name === "NotAllowedError");
+		}
+
+		// A file input makes Chrome say the files are being uploaded. The read-only
+		// picker asks to view them instead, and the page still only reads them locally.
+		async function pickDirectory(kind, fallbackId) {
+			if (!window.showDirectoryPicker) {
+				document.getElementById(fallbackId).click();
+				return;
+			}
+			let handle;
+			try {
+				handle = await window.showDirectoryPicker({ mode: "read" });
+			} catch (err) {
+				if (!cancelled(err)) document.getElementById(fallbackId).click();
+				return;
+			}
+			statusEl.textContent = "Reading files…";
+			const files = await filesInDirectory(handle);
+			const ignore = files.some(function (file) { return file.name === "_IgnoreVanilla.txt"; });
+			addSource(kind, files, handle.name, kind === "sprites" && ignore);
+			if (files.length) rebuild();
+			else draw();
+		}
+
+		async function pickSpriteFiles() {
+			if (!window.showOpenFilePicker) {
+				document.getElementById("sprite-files").click();
+				return;
+			}
+			let handles;
+			try {
+				handles = await window.showOpenFilePicker({
+					multiple: true,
+					types: [{ description: "Sprite text", accept: { "text/plain": [".txt"] } }]
+				});
+			} catch (err) {
+				if (!cancelled(err)) document.getElementById("sprite-files").click();
+				return;
+			}
+			statusEl.textContent = "Reading files…";
+			const files = [];
+			for (let i = 0; i < handles.length; i++) files.push(await handles[i].getFile());
+			const ignore = files.some(function (file) { return file.name === "_IgnoreVanilla.txt"; });
+			addSource("sprites", files, folderLabel(files), ignore);
+			if (files.length) rebuild();
+			else draw();
+		}
+
 		document.getElementById("add-faces").addEventListener("click", function () {
-			document.getElementById("face-folder").click();
+			pickDirectory("faces", "face-folder");
 		});
 		document.getElementById("add-sprites").addEventListener("click", function () {
-			document.getElementById("sprite-files").click();
+			pickSpriteFiles();
 		});
 		document.getElementById("add-sprite-folder").addEventListener("click", function () {
-			document.getElementById("sprite-folder").click();
+			pickDirectory("sprites", "sprite-folder");
 		});
 
 		appearanceEl.addEventListener("change", function () {
