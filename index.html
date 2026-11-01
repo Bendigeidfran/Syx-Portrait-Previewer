@@ -92,7 +92,18 @@
 		label.check { flex-direction: row; align-items: center; gap: 6px; color: var(--ink); }
 		input[type="range"] { width: 140px; }
 		.randoms label { min-width: 92px; }
-		#pieces { display: flex; flex-direction: column; gap: 6px; }
+		#colours, #pieces { display: flex; flex-direction: column; gap: 6px; }
+		.colour { display: flex; flex-direction: column; gap: 4px; padding: 6px 0; border-top: 1px solid var(--line); }
+		.colour .head { display: flex; align-items: baseline; gap: 8px; }
+		.colour .name { font-variant-numeric: tabular-nums; }
+		.colour .note { color: var(--muted); font-size: 0.85rem; }
+		.swatches { display: flex; flex-wrap: wrap; gap: 3px; }
+		.colour button.swatch { width: 14px; height: 14px; padding: 0; border: 1px solid var(--line); border-radius: 2px; cursor: pointer; }
+		.swatch.active { outline: 2px solid var(--accent); outline-offset: 1px; }
+		.colour .rgb { display: flex; align-items: center; gap: 8px; }
+		.colour .values { font-variant-numeric: tabular-nums; min-width: 8.5em; }
+		.colour input[type="color"] { width: 36px; height: 28px; padding: 0; background: transparent; }
+		.colour button { padding: 2px 8px; }
 		.piece { display: flex; align-items: center; gap: 8px; }
 		.piece .name { flex: 1; min-width: 0; }
 		.piece .count { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -148,6 +159,11 @@
 						<input id="scale" type="range" min="1" max="8" step="1" value="4">
 					</label>
 				</div>
+			</section>
+			<section>
+				<h2>Colours</h2>
+				<div id="colours"></div>
+				<p class="hint">Click a swatch to use that colour. The outlined swatch is the one this portrait is using. Reset reads that value from the sprite file again. Roll and Randomise keep the colours and the swatch you choose.</p>
 			</section>
 			<section>
 				<h2>Pieces</h2>

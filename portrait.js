@@ -937,24 +937,20 @@
 		});
 	}
 
+	function colorSlot(col, subject, warnings) {
+		if (col.useSlot != null && col.useSlot >= 0 && col.useSlot < col.slots.length && col.slots[col.useSlot]) return col.useSlot;
+		if (col.pick && col.pick !== "EQUIP_BATTLE_ARMOUR_PLATE" && warnings && !warnedStats.has("stat:" + col.pick)) {
+			warnedStats.add("stat:" + col.pick);
+			warnings.push(col.pick + " is not wired to a knob, so " + col.name + " is picked at random");
+		}
+		if (col.pick === "EQUIP_BATTLE_ARMOUR_PLATE") return javaMod(Math.trunc((subject.plate / PLATE_MAX) * 15), 16);
+		const raw = bitGet(subject.ints, 64, 31);
+		return javaMod(raw >> ((col.index & 15) * 4), 16);
+	}
+
 	function collectionColor(col, subject, warnings) {
 		if (subject.retired && col.gray) return GREY.slice();
-		let slot;
-		if (col.pick) {
-			if (col.pick === "EQUIP_BATTLE_ARMOUR_PLATE") {
-				slot = javaMod(Math.trunc((subject.plate / PLATE_MAX) * 15), 16);
-			} else {
-				if (!warnedStats.has("stat:" + col.pick)) {
-					warnedStats.add("stat:" + col.pick);
-					warnings.push(col.pick + " is not wired to a knob, so " + col.name + " is picked at random");
-				}
-				const raw = bitGet(subject.ints, 64, 31);
-				slot = javaMod(raw >> ((col.index & 15) * 4), 16);
-			}
-		} else {
-			const raw = bitGet(subject.ints, 64, 31);
-			slot = javaMod(raw >> ((col.index & 15) * 4), 16);
-		}
+		const slot = colorSlot(col, subject, warnings);
 		let color = col.slots[slot].slice();
 		if (subject.dead && col.whiteDead) {
 			color = color.map(function (channel, index) {
@@ -1282,6 +1278,7 @@
 		const statusEl = document.getElementById("status");
 		const partsEl = document.getElementById("parts");
 		const piecesEl = document.getElementById("pieces");
+		const coloursEl = document.getElementById("colours");
 		const seedEl = document.getElementById("seed");
 		const intsEl = document.getElementById("ints");
 		const dropEl = document.getElementById("drop");
@@ -1307,7 +1304,9 @@
 			injury: 0,
 			scale: 4,
 			loadWarnings: [],
-			picks: []
+			picks: [],
+			colorEdits: {},
+			colorPicks: {}
 		};
 
 		function subject() {
@@ -1403,7 +1402,203 @@
 			}
 		}
 
-		function draw() {
+		function rgbHex(color) {
+			return "#" + color.map(function (channel) {
+				const text = (channel & 255).toString(16);
+				return text.length === 1 ? "0" + text : text;
+			}).join("");
+		}
+
+		function hexToRgb(hex) {
+			const value = parseInt(hex.slice(1), 16);
+			return [(value >> 16) & 255, (value >> 8) & 255, value & 255];
+		}
+
+		function editsFor(name) {
+			if (!state.colorEdits[name]) state.colorEdits[name] = { slots: {} };
+			return state.colorEdits[name];
+		}
+
+		function applyColorEdits(appearance) {
+			const edits = state.colorEdits[appearance.name];
+			const picks = state.colorPicks[appearance.name];
+			const collections = appearance.colors && appearance.colors.list ? appearance.colors.list : [];
+			collections.forEach(function (col) {
+				const chosen = picks && picks[col.name];
+				if (chosen != null && chosen >= 0 && chosen < col.slots.length && col.slots[chosen]) col.useSlot = chosen;
+				if (!edits) return;
+				const slots = edits.slots[col.name];
+				if (!slots) return;
+				Object.keys(slots).forEach(function (key) {
+					const index = Number(key);
+					if (index >= 0 && index < col.slots.length) col.slots[index] = slots[key].slice();
+				});
+			});
+			if (edits && edits.blood) appearance.blood = edits.blood.slice();
+		}
+
+		function chooseSlot(appearance, col, index) {
+			if (!state.colorPicks[appearance.name]) state.colorPicks[appearance.name] = {};
+			state.colorPicks[appearance.name][col.name] = index;
+			col.useSlot = index;
+			draw();
+		}
+
+		function rememberSlot(appearance, col, slot) {
+			const edits = editsFor(appearance.name);
+			if (!edits.slots[col.name]) edits.slots[col.name] = {};
+			edits.slots[col.name][String(slot)] = col.slots[slot].slice();
+		}
+
+		function dropSlotEdit(race, collection, slot) {
+			const edits = state.colorEdits[race];
+			if (!edits || !edits.slots[collection]) return;
+			delete edits.slots[collection][String(slot)];
+		}
+
+		function colorNote(col, subj) {
+			const notes = [];
+			if (subj.retired && col.gray) notes.push("Retired shows this as grey.");
+			if (subj.dead && col.whiteDead) notes.push("Dead mixes this toward white.");
+			if (subj.sick && col.sick) notes.push("Sick tints this.");
+			return notes.join(" ");
+		}
+
+		function renderColours(appearance) {
+			coloursEl.innerHTML = "";
+			if (!appearance) {
+				const empty = document.createElement("p");
+				empty.className = "hint";
+				empty.textContent = "Drop data.zip to see this race's colours.";
+				coloursEl.appendChild(empty);
+				return;
+			}
+			const subj = subject();
+			const collections = appearance.colors && appearance.colors.list ? appearance.colors.list : [];
+			collections.forEach(function (col) {
+				coloursEl.appendChild(colourRow(appearance, col, colorSlot(col, subj, null), subj));
+			});
+			coloursEl.appendChild(bloodRow(appearance));
+		}
+
+		function colourRow(appearance, col, slot, subj) {
+			const row = document.createElement("div");
+			row.className = "colour";
+			const head = document.createElement("div");
+			head.className = "head";
+			const name = document.createElement("span");
+			name.className = "name";
+			name.textContent = col.name;
+			head.appendChild(name);
+			const noteText = colorNote(col, subj);
+			if (noteText) {
+				const note = document.createElement("span");
+				note.className = "note";
+				note.textContent = noteText;
+				head.appendChild(note);
+			}
+			const swatches = document.createElement("div");
+			swatches.className = "swatches";
+			let active = null;
+			col.slots.forEach(function (color, index) {
+				if (!color) return;
+				const swatch = document.createElement("button");
+				swatch.type = "button";
+				swatch.className = "swatch" + (index === slot ? " active" : "");
+				swatch.style.background = rgbHex(color);
+				swatch.title = color.join(" ");
+				swatch.setAttribute("aria-label", col.name + " " + color.join(" "));
+				swatch.setAttribute("aria-pressed", index === slot ? "true" : "false");
+				swatch.addEventListener("click", function () { chooseSlot(appearance, col, index); });
+				if (index === slot) active = swatch;
+				swatches.appendChild(swatch);
+			});
+			const rgb = document.createElement("div");
+			rgb.className = "rgb";
+			const values = document.createElement("span");
+			values.className = "values";
+			const stored = col.slots[slot] || [0, 0, 0];
+			values.textContent = stored.join(" ");
+			const input = document.createElement("input");
+			input.type = "color";
+			input.value = rgbHex(stored);
+			input.setAttribute("aria-label", col.name + " colour");
+			input.addEventListener("input", function () {
+				const next = hexToRgb(input.value);
+				col.slots[slot] = next;
+				rememberSlot(appearance, col, slot);
+				values.textContent = next.join(" ");
+				if (active) active.style.background = input.value;
+				draw(true);
+			});
+			const reset = document.createElement("button");
+			reset.type = "button";
+			reset.textContent = "Reset";
+			reset.addEventListener("click", function () {
+				dropSlotEdit(appearance.name, col.name, slot);
+				rebuild(true);
+			});
+			rgb.appendChild(values);
+			rgb.appendChild(input);
+			rgb.appendChild(reset);
+			row.appendChild(head);
+			row.appendChild(swatches);
+			row.appendChild(rgb);
+			return row;
+		}
+
+		function bloodRow(appearance) {
+			const row = document.createElement("div");
+			row.className = "colour";
+			const head = document.createElement("div");
+			head.className = "head";
+			const name = document.createElement("span");
+			name.className = "name";
+			name.textContent = "Blood";
+			head.appendChild(name);
+			const swatches = document.createElement("div");
+			swatches.className = "swatches";
+			const swatch = document.createElement("span");
+			swatch.className = "swatch active";
+			const blood = appearance.blood || [0, 0, 0];
+			swatch.style.background = rgbHex(blood);
+			swatch.title = blood.join(" ");
+			swatches.appendChild(swatch);
+			const rgb = document.createElement("div");
+			rgb.className = "rgb";
+			const values = document.createElement("span");
+			values.className = "values";
+			values.textContent = blood.join(" ");
+			const input = document.createElement("input");
+			input.type = "color";
+			input.value = rgbHex(blood);
+			input.setAttribute("aria-label", "Blood colour");
+			input.addEventListener("input", function () {
+				const next = hexToRgb(input.value);
+				appearance.blood = next;
+				editsFor(appearance.name).blood = next.slice();
+				values.textContent = next.join(" ");
+				swatch.style.background = input.value;
+				draw(true);
+			});
+			const reset = document.createElement("button");
+			reset.type = "button";
+			reset.textContent = "Reset";
+			reset.addEventListener("click", function () {
+				const edits = state.colorEdits[appearance.name];
+				if (edits) delete edits.blood;
+				rebuild(true);
+			});
+			rgb.appendChild(values);
+			rgb.appendChild(input);
+			rgb.appendChild(reset);
+			row.appendChild(head);
+			row.appendChild(swatches);
+			row.appendChild(rgb);
+			return row;
+		}
+
+		function draw(keepColours) {
 			syncRandomSliders();
 			intsEl.textContent = state.ints.map(toSigned).join(", ");
 			const appearance = state.appearances[state.appearance];
@@ -1417,6 +1612,7 @@
 				statusEl.textContent = state.vanilla ? "No sprite files found." : "Drop the game's data.zip onto this page.";
 				partsEl.textContent = "";
 				renderPieces([], subject(), []);
+				if (!keepColours) renderColours(null);
 				showWarnings(warnings);
 				return;
 			}
@@ -1428,6 +1624,7 @@
 			statusEl.textContent = appearance.name + " · " + type.label + " · " + result.drawn + " of " + result.total + " parts";
 			partsEl.textContent = result.names.length ? result.names.join(", ") : "Nothing drawn.";
 			renderPieces(type.face, subject(), result.choices);
+			if (!keepColours) renderColours(appearance);
 			showWarnings(warnings);
 		}
 
@@ -1591,6 +1788,7 @@
 			state.images = layers.images;
 			state.loadWarnings = warnings;
 			state.appearances = state.vanilla ? appearancesFromSources(layers.sprites, warnings) : [];
+			state.appearances.forEach(applyColorEdits);
 			const kept = state.appearances.findIndex(function (item) { return item.name === raceBefore; });
 			state.appearance = kept >= 0 ? kept : 0;
 			fillSelect(appearanceEl, state.appearances.map(function (item) { return item.name; }), state.appearance);
